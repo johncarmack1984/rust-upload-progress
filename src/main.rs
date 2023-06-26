@@ -6,20 +6,26 @@ use aws_sdk_s3::{
     Client as S3Client,
 };
 use aws_smithy_http::byte_stream::{ByteStream, Length};
+// use aws_smithy_http::byte_stream::{ByteStream, Length};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
-use std::{fs::File, io::Write, path::Path};
+use rust_upload_progress::TrackableBodyStream;
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 //In bytes, minimum chunk size of 5MB. Increase CHUNK_SIZE to send larger chunks.
 const CHUNK_SIZE: u64 = 1024 * 1024 * 5;
 const MAX_CHUNKS: u64 = 10000;
 
 pub async fn upload_file(
-    client: &S3Client,
+    aws_client: &S3Client,
     bucket_name: &str,
     key: &str,
 ) -> Result<(), Box<(dyn std::error::Error + 'static)>> {
-    let multipart_upload_res: CreateMultipartUploadOutput = client
+    let multipart_upload_res: CreateMultipartUploadOutput = aws_client
         .create_multipart_upload()
         .bucket(bucket_name)
         .key(key)
@@ -30,22 +36,31 @@ pub async fn upload_file(
     // snippet-end:[rust.example_code.s3.create_multipart_upload]
     let upload_id = multipart_upload_res.upload_id().unwrap();
 
-    println!("Creating sample file.");
-    //Create a file of random characters for the upload.
-    let mut file = File::create(&key).expect("Could not create sample file.");
-    // Loop until the file is 5 chunks.
-    while file.metadata().unwrap().len() <= CHUNK_SIZE * 4 {
-        let rand_string: String = thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(256)
-            .map(char::from)
-            .collect();
-        let return_string: String = "\n".to_string();
-        file.write_all(rand_string.as_ref())
-            .expect("Error writing to file.");
-        file.write_all(return_string.as_ref())
-            .expect("Error writing to file.");
-    }
+    // //Create a file of random characters for the upload.
+    // let mut file = File::create(&key).expect("Could not create sample file.");
+    // // Loop until the file is 5 chunks.
+    // let pb_local_write = ProgressBar::new(CHUNK_SIZE * 4);
+    // pb_local_write.set_style(ProgressStyle::default_bar()
+    //     .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.white/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+    //     .unwrap()
+    //     .progress_chars("█  "));
+    // let msg_local_write = format!("Creating sample file.");
+    // pb_local_write.set_message(msg_local_write);
+    // while file.metadata().unwrap().len() <= CHUNK_SIZE * 4 {
+    //     let rand_string: String = thread_rng()
+    //         .sample_iter(&Alphanumeric)
+    //         .take(256)
+    //         .map(char::from)
+    //         .collect();
+    //     let return_string: String = "\n".to_string();
+    //     file.write_all(rand_string.as_ref())
+    //         .expect("Error writing to file.");
+    //     pb_local_write.set_position(file.metadata().unwrap().len());
+    //     file.write_all(return_string.as_ref())
+    //         .expect("Error writing to file.");
+    //     pb_local_write.set_position(file.metadata().unwrap().len());
+    // }
+    // pb_local_write.finish_with_message("Done writing sample file.");
     // let mut file = File::open(key).unwrap();
 
     let path = Path::new(&key);
@@ -87,9 +102,25 @@ pub async fn upload_file(
             CHUNK_SIZE
         };
         let uploaded = chunk_index * CHUNK_SIZE;
+        pb.set_message(format!(
+            "Uploading chunk {} of {}.",
+            chunk_index + 1,
+            chunk_count
+        ));
+        // let mut body = TrackableBodyStream::try_from(PathBuf::from(key)).unwrap();
+        // body.chunk_size(CHUNK_SIZE as usize);
+        // body.offset(uploaded);
+        // body.length(this_chunk);
+        // println!("{}", body.content_length());
+        // body.set_callback(move |tot_size: u64, sent: u64, cur_buf: u64| {
+        // pb.inc(cur_buf as u64);
+        // if sent == tot_size {
+        //     pb.finish();
+        // }
+        // });h
         let stream = ByteStream::read_from()
             .path(path)
-            .offset(chunk_index * CHUNK_SIZE)
+            .offset(uploaded)
             .length(Length::Exact(this_chunk))
             .build()
             .await
@@ -97,12 +128,13 @@ pub async fn upload_file(
         //Chunk index needs to start at 0, but part numbers start at 1.
         let part_number = (chunk_index as i32) + 1;
         // snippet-start:[rust.example_code.s3.upload_part]
-        let upload_part_res = client
+        let upload_part_res = aws_client
             .upload_part()
             .key(key)
             .bucket(bucket_name)
             .upload_id(upload_id)
             .body(stream)
+            // .body(stream.to_multipart_s3_stream())
             .part_number(part_number)
             .send()
             .await?;
@@ -123,7 +155,7 @@ pub async fn upload_file(
     // snippet-end:[rust.example_code.s3.upload_part.CompletedMultipartUpload]
     println!("Completing upload.");
     // snippet-start:[rust.example_code.s3.complete_multipart_upload]
-    let _complete_multipart_upload_res = client
+    let _complete_multipart_upload_res = aws_client
         .complete_multipart_upload()
         .bucket(bucket_name)
         .key(key)
@@ -132,7 +164,7 @@ pub async fn upload_file(
         .send()
         .await
         .unwrap();
-    // snippet-end:[rust.example_code.s3.complete_multipart_upload]
+    // // snippet-end:[rust.example_code.s3.complete_multipart_upload]
     println!("Done uploading file.");
 
     return Ok(());
@@ -144,10 +176,10 @@ async fn main() {
         .or_default_provider()
         .or_else("us-east-1");
     let sdk_config = aws_config::from_env().region(region_provider).load().await;
-    let client = S3Client::new(&sdk_config);
+    let aws_client = S3Client::new(&sdk_config);
     let bucket_name = format!("s3-upload-test-jmc1984");
     let key = "sample.txt".to_string();
-    client
+    aws_client
         .delete_object()
         .bucket(&bucket_name)
         .key(&key)
@@ -156,5 +188,5 @@ async fn main() {
         .unwrap();
 
     println!("Object deleted.");
-    upload_file(&client, &bucket_name, &key).await.unwrap();
+    upload_file(&aws_client, &bucket_name, &key).await.unwrap();
 }
